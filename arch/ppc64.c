@@ -26,6 +26,12 @@
 #include <endian.h>
 
 /*
+ * If PAGE_PTE is set, then it's a leaf PTE for hugepage
+ */
+#define PAGE_PTE (1UL << 62)
+#define IS_HUGEPAGE(pte) (!!((pte) & PAGE_PTE))
+
+/*
  * Swaps a 8 byte value
  */
 static ulong swap64(ulong val, uint swap)
@@ -219,12 +225,21 @@ ppc64_vmemmap_init(void)
 	if (!readmem(VADDR, SYMBOL(vmemmap_list), &head, sizeof(unsigned long)))
 		return FALSE;
 
-	/*
-	 * Get vmemmap list count and populate vmemmap regions info
-	 */
-	info->vmemmap_cnt = get_vmemmap_list_info(head);
-	if (info->vmemmap_cnt == 0)
-		return FALSE;
+	if (head == 0) {
+		/*
+		 * vmemmap_list has not been populated by kernel
+		 */
+
+		info->vmemmap_list = NULL;
+		info->vmemmap_start = 0xc00c000000000000;
+	} else {
+		/*
+		 * Get vmemmap list count and populate vmemmap regions info
+		 */
+		info->vmemmap_cnt = get_vmemmap_list_info(head);
+		if (info->vmemmap_cnt == 0)
+			return FALSE;
+	}
 
 	info->flag_vmemmap = TRUE;
 	return TRUE;
@@ -347,29 +362,6 @@ ppc64_vmalloc_init(void)
 	return TRUE;
 }
 
-/*
- *  If the vmemmap address translation information is stored in the kernel,
- *  make the translation.
- */
-static unsigned long long
-ppc64_vmemmap_to_phys(unsigned long vaddr)
-{
-	int	i;
-	ulong	offset;
-	unsigned long long paddr = NOT_PADDR;
-
-	for (i = 0; i < info->vmemmap_cnt; i++) {
-		if ((vaddr >= info->vmemmap_list[i].virt) && (vaddr <
-		    (info->vmemmap_list[i].virt + info->vmemmap_psize))) {
-			offset = vaddr - info->vmemmap_list[i].virt;
-			paddr = info->vmemmap_list[i].phys + offset;
-			break;
-		}
-	}
-
-	return paddr;
-}
-
 static unsigned long long
 ppc64_vtop_level4(unsigned long vaddr)
 {
@@ -379,6 +371,8 @@ ppc64_vtop_level4(unsigned long vaddr)
 	unsigned long long pgd_pte, pud_pte;
 	unsigned long long pmd_pte, pte;
 	unsigned long long paddr = NOT_PADDR;
+	uint is_hugepage = 0;
+	uint pdshift;
 	uint swap = 0;
 
 	if (info->page_buf == NULL) {
@@ -404,7 +398,34 @@ ppc64_vtop_level4(unsigned long vaddr)
 	}
 
 	level4 = (ulong *)info->kernel_pgd;
-	pgdir = (ulong *)((ulong *)level4 + PGD_OFFSET_L4(vaddr));
+
+	ulong pgd_offset_l4 = PGD_OFFSET_L4(vaddr);
+
+	if (vaddr >= info->vmemmap_start) {
+		/*
+		 * For vmemmap addresses, the PGD_OFFSET_L4() offset does not work
+		 *
+		 * Logically it should be the offset from level4
+		 *
+		 * Say for a running kernel, pgd is at 0xc00000000009c000
+		 *
+		 * We read from level4, which will come out to be 0xc000000000090000
+		 * into info->page_buf
+		 *
+		 * So, to be able to read the pgd_pte, PAGEOFFSET(pgdir) needs to be
+		 * 0xc000, which essentially needs pgdir to be 0xc00000000009c000
+		 *
+		 * Since level4 is 0xc000000000090000, we need offset to be 0xc000,
+		 * but considering pointer arithmetic:
+		 * since 'level4' is 8-byte ulong* array, adding 1 actually moves 8
+		 * bytes. Here we need to move 0xc000 bytes
+		 *
+		 * So pgd_offset_l4 will be 0xc000 / 8 = 0x1800
+		 */
+
+		pgd_offset_l4 = 0x1800;
+	}
+	pgdir = (ulong *)((ulong *)level4 + pgd_offset_l4);
 	if (!readmem(VADDR, PAGEBASE(level4), info->page_buf, PAGESIZE())) {
 		ERRMSG("Can't read PGD page: 0x%llx\n", PAGEBASE(level4));
 		return NOT_PADDR;
@@ -412,6 +433,13 @@ ppc64_vtop_level4(unsigned long vaddr)
 	pgd_pte = swap64(ULONG((info->page_buf + PAGEOFFSET(pgdir))), swap);
 	if (!pgd_pte)
 		return NOT_PADDR;
+
+	if (IS_HUGEPAGE(pgd_pte)) {
+		is_hugepage = 1;
+		pte = pgd_pte;
+		pdshift = info->l4_shift;
+		goto out;
+	}
 
 	/*
 	 * Sometimes we don't have level3 pagetable entries
@@ -426,6 +454,13 @@ ppc64_vtop_level4(unsigned long vaddr)
 		pud_pte = swap64(ULONG((info->page_buf + PAGEOFFSET(page_upper))), swap);
 		if (!pud_pte)
 			return NOT_PADDR;
+
+		if (IS_HUGEPAGE(pud_pte)) {
+			is_hugepage = 1;
+			pte = pud_pte;
+			pdshift = info->l3_shift;
+			goto out;
+		}
 	} else {
 		pud_pte = pgd_pte;
 	}
@@ -439,6 +474,13 @@ ppc64_vtop_level4(unsigned long vaddr)
 	pmd_pte = swap64(ULONG((info->page_buf + PAGEOFFSET(page_middle))), swap);
 	if (!(pmd_pte))
 		return NOT_PADDR;
+
+	if (IS_HUGEPAGE(pmd_pte)) {
+		is_hugepage = 1;
+		pte = pmd_pte;
+		pdshift = info->l2_shift;
+		goto out;
+	}
 
 	pmd_pte = pmd_page_vaddr_l4(pmd_pte);
 	page_table = (ulong *)(pmd_pte)
@@ -456,8 +498,40 @@ ppc64_vtop_level4(unsigned long vaddr)
 	if (!pte)
 		return NOT_PADDR;
 
-	paddr = PAGEBASE(PTOB((pte & info->pte_rpn_mask) >> info->pte_rpn_shift))
+out:
+	if (is_hugepage) {
+		paddr = PAGEBASE(PTOB((pte & info->pte_rpn_mask) >> info->pte_rpn_shift))
+			+ (vaddr & ((1UL << pdshift) - 1));
+	} else {
+		paddr = PAGEBASE(PTOB((pte & info->pte_rpn_mask) >> info->pte_rpn_shift))
 			+ PAGEOFFSET(vaddr);
+	}
+
+	return paddr;
+}
+
+/*
+ *  If the vmemmap address translation information is stored in the kernel,
+ *  make the translation.
+ */
+static unsigned long long
+ppc64_vmemmap_to_phys(unsigned long vaddr)
+{
+	int	i;
+	ulong	offset;
+	unsigned long long paddr = NOT_PADDR;
+
+	if (!info->vmemmap_list)
+		return ppc64_vtop_level4(vaddr);
+
+	for (i = 0; i < info->vmemmap_cnt; i++) {
+		if ((vaddr >= info->vmemmap_list[i].virt) && (vaddr <
+		    (info->vmemmap_list[i].virt + info->vmemmap_psize))) {
+			offset = vaddr - info->vmemmap_list[i].virt;
+			paddr = info->vmemmap_list[i].phys + offset;
+			break;
+		}
+	}
 
 	return paddr;
 }
